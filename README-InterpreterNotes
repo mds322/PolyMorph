@@ -1,0 +1,212 @@
+//README-Interpreter//
+
+NOTE: The interpreter used to permit abritary functions was developed with significant assistance from the gpt-5.2 model. For design clarity (and to permit ease of debugging if problems arise in the future), a summary of the interepreter's design is given below (as output from the gpt-5.2. model). Other components from the code were templated by GPT5-2, but had more hands-on guidance. 
+
+-----------------------------------------------------
+(GPT-5.2 Derived Design Summary and Notes for Interpreter)
+
+High-level design
+-----------------
+We implement a two-phase pipeline per expression:
+
+1) Compile (infix string -> RPN program)
+   - Input: human-readable infix expression like "t*t + 2*t + 1"
+   - Output: an array of tokens in Reverse Polish Notation (RPN), stored in Expr.rpn[]
+   - Method: shunting-yard algorithm (operator stack + output queue)
+
+2) Evaluate (RPN program -> numeric result)
+   - Input: compiled Expr.rpn[] plus a numeric parameter t
+   - Output: one double result
+   - Method: execute RPN tokens with a numeric value stack
+
+
+Why RPN (Reverse Polish Notation)?
+---------------------------------
+RPN removes the need to handle precedence and parentheses during evaluation.
+Evaluation becomes a single tight loop over tokens. This is important because in
+curve sampling we evaluate x(t), y(t), z(t) many times for many t values.
+
+In short:
+- Parse once (compile)
+- Evaluate many times (fast, iterative, no recursion)
+- Minimal allocation (one token array per expression)
+- Easy to detect stack underflow/overflow during evaluation
+
+
+Token types
+-----------
+The compiler produces a linear program of tokens (ExprTok):
+
+- NUM(value)        : push constant value onto value stack
+- VAR_T             : push current t onto value stack
+- OP(opchar)        : pop operands and apply operator (+ - * / ^, unary minus '~')
+- FN1(func_index)   : pop 1 operand, apply 1-arg function, push result
+- FN2(func_index)   : pop 2 operands, apply 2-arg function, push result
+
+
+Phase 1: Compile (infix -> RPN)
+-------------------------------
+Compile uses a variant of Dijkstra’s shunting-yard algorithm.
+
+Data structures:
+- output_rpn: dynamic array (Expr.rpn[]) where compiled tokens are appended
+- op_stack  : temporary stack of operators and function markers
+
+op_stack elements:
+- operator chars: '+', '-', '*', '/', '^', '~' (unary minus)
+- '(' marker
+- function marker: negative integer -(func_index + 1)
+
+Operator rules:
+- precedence:  '~' > '^' > '*' '/' > '+' '-'
+- associativity: '^' and '~' are right-associative, others left-associative
+
+Core compile pseudo-code:
+  output_rpn = []
+  op_stack = []
+
+  for each token scanned left-to-right:
+    if token is NUMBER:
+      output_rpn.push(NUM(token.value))
+
+    else if token is IDENT:
+      if ident == "t":  output_rpn.push(VAR_T)
+      else if ident == "pi": output_rpn.push(NUM(pi))
+      else if ident == "e":  output_rpn.push(NUM(e))
+      else if ident is a known function name:
+        op_stack.push(FUNC_MARKER(ident))
+      else:
+        error unknown identifier
+
+    else if token is OPERATOR op:
+      if op is unary based on previous token:
+        rewrite '-' as '~', ignore unary '+'
+
+      while op_stack top is an operator (not '(' and not function marker) AND
+            (top_prec > op_prec OR
+             (top_prec == op_prec AND op is left-associative)):
+        output_rpn.push(OP(pop(op_stack)))
+
+      op_stack.push(op)
+
+    else if token is '(':
+      op_stack.push('(')
+
+    else if token is ',':
+      pop operators to output until '(' is found
+      (used for separating arguments in 2-arg function calls)
+
+    else if token is ')':
+      pop operators to output until '(' is found
+      pop '('
+      if op_stack top is a function marker:
+        output_rpn.push(FN1 or FN2 for that function)
+        pop function marker
+
+  after all tokens:
+    pop remaining operators from op_stack to output_rpn
+    error if any '(' remain
+
+
+Phase 2: Evaluate (execute RPN)
+-------------------------------
+Evaluation executes the RPN program using a numeric value stack:
+
+Data structure:
+- val_stack: fixed-size array double[256]
+- val_top  : current size (stack pointer)
+
+Core eval pseudo-code:
+  val_stack = []
+
+  for each instruction in output_rpn:
+    if instruction is NUM(x):
+      push x
+    else if instruction is VAR_T:
+      push t
+    else if instruction is OP('+'):
+      b = pop(); a = pop(); push(a + b)
+    else if instruction is OP('~'):  (unary minus)
+      a = pop(); push(-a)
+    else if instruction is FN1(f):
+      a = pop(); push(f(a))
+    else if instruction is FN2(f):
+      b = pop(); a = pop(); push(f(a,b))
+
+  result = pop()
+  error if stack is not exactly size 1 at end
+
+Domain / NaN / Inf handling:
+- After each operator or function application, evaluation checks isfinite(result).
+- If not finite (NaN or Inf), evaluation fails with EXPR_ERR_DOMAIN.
+
+
+Worked example: Parabola y(t) = t*t
+-----------------------------------
+Goal: evaluate y(t) = t*t at t=3.
+
+Input expression (infix):
+  "t*t"
+
+Compile result (RPN tokens):
+  [ VAR_T, VAR_T, OP('*') ]
+
+Evaluation at t = 3:
+  start: val_stack = []
+  token VAR_T    -> push 3            => [3]
+  token VAR_T    -> push 3            => [3, 3]
+  token OP('*')  -> pop b=3, a=3
+                   push a*b = 9       => [9]
+  end: stack has one value => result = 9
+
+
+Worked example: Quadratic y(t) = t*t + 2*t + 1
+----------------------------------------------
+Input expression (infix):
+  "t*t + 2*t + 1"
+
+One valid RPN output:
+  [ VAR_T, VAR_T, '*', 2, VAR_T, '*', '+', 1, '+' ]
+
+Evaluation at t = 3:
+  push t        => [3]
+  push t        => [3,3]
+  '*'           => [9]
+  push 2        => [9,2]
+  push t        => [9,2,3]
+  '*'           => [9,6]
+  '+'           => [15]
+  push 1        => [15,1]
+  '+'           => [16]
+  result = 16
+
+
+How this ties into curve sampling
+---------------------------------
+For an expression-defined curve, we compile 3 expressions:
+  x(t) from XEXPR
+  y(t) from YEXPR
+  z(t) from ZEXPR
+
+During curve sampling, the curve sampler requests positions at many t values.
+For each t:
+  x = eval(XEXPR, t)
+  y = eval(YEXPR, t)
+  z = eval(ZEXPR, t)
+  point = (x, y, z)
+
+If any component evaluation fails (syntax, unknown identifier, stack error,
+domain error / NaN / Inf), curve sampling aborts and reports:
+- which component failed (x/y/z)
+- which t failed
+- the expression string that failed
+- the interpreter’s error message
+
+
+Notes / constraints
+-------------------
+- Unary minus is encoded as operator '~' in RPN.
+- '^' is right-associative; this matches typical math parsing of exponentiation.
+- The evaluator uses a fixed-size numeric stack (double[256]).
+  Deeply nested expressions may exceed this and return EXPR_ERR_STACK.
+- The interpreter is intentionally small; only variable supported is 't'.
